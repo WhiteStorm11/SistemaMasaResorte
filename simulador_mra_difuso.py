@@ -1,560 +1,811 @@
 """
-Simulador de Sistema Masa-Resorte-Amortiguador con Control Difuso Mamdani
-=========================================================================
-Implementación completa sin librerías difusas externas.
-Interfaz gráfica interactiva con matplotlib.
+╔══════════════════════════════════════════════════════════════════════════════╗
+║  SIMULADOR MRA — CONTROL DIFUSO MAMDANI   (Diseño Educativo GeoGebra)       ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+PLANTA: Sistema Masa-Resorte-Amortiguador (vertical)
+    m·ẍ(t) + b·ẋ(t) + k·x(t) = F(t)
+    Integración Euler explícita,  dt = 0.02 s
+
+CONTROLADOR: FIS Mamdani sin librerías externas
+    Entradas: e(t) = xd − x   [−4,4] m
+              Δe   = −ẋ(t)    [−6,6] m/s
+    Salida  : F(t)            [−40,40] N
+    5 conjuntos triangulares por variable, 25 reglas, defuzz. centroide
+
+EXPORTACIÓN: Excel (.xlsx) con 3 hojas — Parámetros, Datos, Gráficas
+
+RUBRICA CUCEA — Sistemas Dinámicos:
+    ✓ Claridad conceptual  (modelado MRA + FIS Mamdani)
+    ✓ Manejo del modelo    (Euler + 25 reglas + centroide)
+    ✓ Lógica de simulación (Tkinter canvas, dot-plots, sliders)
+    ✓ Gráfica de complemento: x(t) vs xd, e(t), F(t) en tiempo real
 """
 
-import numpy as np
-import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
-import matplotlib.animation as animation
-from matplotlib.widgets import Slider, Button
-from matplotlib.gridspec import GridSpec
+import tkinter as tk
+from tkinter import messagebox
+import math
+import os
+import datetime
+import threading
 from collections import deque
 
 
-# ──────────────────────────────────────────────────────────────
-#  CONTROLADOR DIFUSO MAMDANI
-# ──────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+#  CONTROLADOR DIFUSO MAMDANI  (sin librerías externas)
+# ══════════════════════════════════════════════════════════════════════════════
 
 class FuzzyMRAController:
     """
-    Controlador difuso Mamdani para el sistema masa-resorte-amortiguador.
-
-    Entradas:
-        e  – error de posición  (universo [-4, 4] m)
-        de – derivada del error (universo [-6, 6] m/s)
-    Salida:
-        F  – fuerza de control  (universo [-40, 40] N)
-
-    Conjuntos lingüísticos: NB, N, Z, P, PB (triangulares simétricos)
-    Defuzzificación: centroide. Todo el cómputo es vectorizado con numpy.
+    FIS Mamdani manual.
+    Entradas : e (error), de (derivada del error)
+    Salida   : F (fuerza de control)
+    Conjuntos: 5 triangulares simétricos por variable
+    AND      : mínimo  |  Defuzz: centroide singleton
     """
 
-    # Base de reglas 5×5: fila=índice de e, columna=índice de de
-    # 0=NB, 1=N, 2=Z, 3=P, 4=PB
-    _RULE_ARRAY = np.array([
-        [4, 4, 3, 3, 2],   # e=NB → [PB, PB, P,  P,  Z ]
-        [4, 3, 3, 2, 1],   # e=N  → [PB, P,  P,  Z,  N ]
-        [3, 3, 2, 1, 1],   # e=Z  → [P,  P,  Z,  N,  N ]
-        [3, 2, 1, 1, 0],   # e=P  → [P,  Z,  N,  N,  NB]
-        [2, 1, 1, 0, 0],   # e=PB → [Z,  N,  N,  NB, NB]
-    ])
-
-    # Resolución del universo de salida para defuzzificación
-    _N_UNIVERSE = 201
-
     def __init__(self):
-        # Centros de los conjuntos triangulares
-        self._ce  = np.linspace(-4,  4, 5)   # error
-        self._cde = np.linspace(-6,  6, 5)   # derivada del error
-        # Orden inverso: índice 0 (NB) → +40 N, índice 4 (PB) → -40 N
-        # Necesario para que la tabla de reglas sea coherente con la planta
-        self._cF  = np.linspace(40, -40, 5)  # fuerza
+        self.R_e  = 4.0    # radio universo error [m]
+        self.R_de = 6.0    # radio universo Δe [m/s]
+        self.R_F  = 40.0   # radio universo fuerza [N]
 
-        # Semianchos de los triángulos
-        self._hwe  = 2.0
-        self._hwde = 3.0
-        self._hwF  = 20.0
+        # Tabla 5×5 — índice del conjunto de salida (0=NB…4=PB)
+        # Centros de salida en orden INVERSO: 0→+40 N, 4→-40 N
+        # (coherente con la física: e>0 → x<xd → F>0 para acercar masa)
+        self.rules = [
+            [4, 4, 3, 3, 2],   # e=NB
+            [4, 3, 3, 2, 1],   # e=N
+            [3, 3, 2, 1, 1],   # e=Z
+            [3, 2, 1, 1, 0],   # e=P
+            [2, 1, 1, 0, 0],   # e=PB
+        ]
 
-        # Universo de salida (vector fijo)
-        self._Fu = np.linspace(-40.0, 40.0, self._N_UNIVERSE)
+    @staticmethod
+    def _tri(x, a, b, c):
+        """Función de membresía triangular escalar."""
+        lft = (x - a) / (b - a) if b != a else float(x >= b)
+        rgt = (c - x) / (c - b) if c != b else float(x <= b)
+        return max(0.0, min(lft, rgt))
 
-        # Precomputar las 5 funciones de membresía de salida sobre _Fu
-        # Forma: (5, N_UNIVERSE) — se reutilizan en cada llamada a infer()
-        self._muF_pre = np.maximum(
-            0.0,
-            1.0 - np.abs(self._Fu[None, :] - self._cF[:, None]) / self._hwF
-        )  # (5, N_UNIVERSE)
+    def _universe(self, R):
+        """5 triángulos uniformes sobre [−R, R]."""
+        h = R / 2.0
+        return [(-R,-R,-h), (-R,-h,0.0), (-h,0.0,h), (0.0,h,R), (h,R,R)]
 
-        # Máscara booleana: para cada conjunto de salida k, qué reglas producen k
-        # Forma: (5, 5, 5) → [k, i, j] = True si RULE[i,j]==k
-        self._rule_mask = np.stack(
-            [self._RULE_ARRAY == k for k in range(5)]
-        )  # (5, 5, 5)
+    def _fuzzify(self, val, R):
+        val = max(-R, min(R, val))
+        return [self._tri(val, a, b, c) for a, b, c in self._universe(R)]
 
-    # ── Fuzzificación vectorizada ─────────────────────────────
-    def _fuzzify_vec(self, val: float, centers: np.ndarray,
-                     hw: float) -> np.ndarray:
-        """Calcula los 5 grados de membresía triangular con numpy puro."""
-        return np.maximum(0.0, 1.0 - np.abs(val - centers) / hw)
+    def infer(self, e, de):
+        """Inferencia completa → fuerza F en Newtons."""
+        mu_e  = self._fuzzify(e,  self.R_e)
+        mu_de = self._fuzzify(de, self.R_de)
 
-    # ── Inferencia y defuzzificación ─────────────────────────
-    def infer(self, e: float, de: float) -> float:
-        """
-        Ciclo completo de inferencia Mamdani completamente vectorizado.
+        # Centros singleton (orden inverso para coherencia física)
+        raw_c = [b for (_, b, _) in self._universe(self.R_F)]  # [-40,-20,0,20,40]
+        c_F   = list(reversed(raw_c))                           # [40, 20, 0,-20,-40]
 
-        1. Fuzzifica e y de (vectorizado).
-        2. Calcula las 25 activaciones con producto exterior + mínimo.
-        3. Para cada conjunto de salida toma el máximo alpha entre sus reglas.
-        4. Construye la función agregada por mínimo(alpha, muF_pre[k]).
-        5. Defuzzifica por centroide.
+        num, den = 0.0, 0.0
+        for i in range(5):
+            for j in range(5):
+                alpha = min(mu_e[i], mu_de[j])
+                if alpha > 1e-9:
+                    num += alpha * c_F[self.rules[i][j]]
+                    den += alpha
 
-        Parámetros
-        ----------
-        e  : error de posición (m)
-        de : derivada del error (m/s)
-
-        Retorna
-        -------
-        F  : fuerza de control (N) acotada a [-40, 40]
-        """
-        # Fuzzificación — resultado: (5,) cada uno
-        mu_e  = self._fuzzify_vec(np.clip(e,  -4.,  4.),  self._ce,  self._hwe)
-        mu_de = self._fuzzify_vec(np.clip(de, -6.,  6.),  self._cde, self._hwde)
-
-        # Activaciones de las 25 reglas: alpha[i,j] = min(mu_e[i], mu_de[j])
-        # Producto exterior con mínimo → (5, 5)
-        alpha = np.minimum(mu_e[:, None], mu_de[None, :])
-
-        # Para cada conjunto de salida k: alpha máximo entre todas sus reglas
-        # _rule_mask[k]: (5,5) booleana → aplica máscara y reduce
-        # Resultado: vector (5,) con el "corte" de cada conjunto de salida
-        alpha_k = np.array([
-            alpha[self._rule_mask[k]].max() if self._rule_mask[k].any() else 0.0
-            for k in range(5)
-        ])  # (5,)
-
-        # Agregación: para cada k, recortar muF_pre[k] a alpha_k[k]
-        # Luego tomar el máximo puntual → función agregada (N_UNIVERSE,)
-        # np.minimum broadcast: (5,1) y (5, N_UNIVERSE) → (5, N_UNIVERSE)
-        clipped = np.minimum(alpha_k[:, None], self._muF_pre)  # (5, N_UNIVERSE)
-        agg     = clipped.max(axis=0)                          # (N_UNIVERSE,)
-
-        # Defuzzificación por centroide
-        denom = agg.sum()
-        if denom < 1e-9:
+        if den < 1e-9:
             return 0.0
+        return max(-self.R_F, min(self.R_F, num / den))
 
-        return float(np.clip((self._Fu * agg).sum() / denom, -40., 40.))
 
-
-# ──────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 #  PLANTA: SISTEMA MASA-RESORTE-AMORTIGUADOR
-# ──────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 
 class MRASystem:
     """
-    Modelo de la planta masa-resorte-amortiguador.
-
-    Ecuación de movimiento:  m·x'' + b·x' + k·x = F(t)
-    Integración: Euler explícito, dt = 0.02 s.
+    m·ẍ + b·ẋ + k·x = F(t)
+    Integración Euler explícita, dt = 0.02 s.
+    x positivo = desplazamiento hacia abajo.
     """
+    DT = 0.02
 
-    def __init__(self, m: float = 1.0, k: float = 10.0,
-                 b: float = 1.0, dt: float = 0.02):
-        self.m  = m
-        self.k  = k
-        self.b  = b
-        self.dt = dt
-        self.x  = 0.0
-        self.v  = 0.0
-
-    def step(self, F: float):
-        """Avanza un paso Euler: devuelve (x, v) actualizados."""
-        a      = (F - self.b * self.v - self.k * self.x) / self.m
-        self.x += self.v * self.dt
-        self.v += a      * self.dt
-        return self.x, self.v
+    def __init__(self, m=1.0, k=10.0, b=2.0, xd=1.0):
+        self.m = m; self.k = k; self.b = b; self.xd = xd
+        self.reset()
 
     def reset(self):
-        self.x = 0.0
-        self.v = 0.0
+        self.x = 0.0; self.v = 0.0; self.t = 0.0
+        self._peak_x  = 0.0    # para calcular sobrepaso
+        self._t_settle = None  # tiempo de asentamiento
+
+    def step(self, F):
+        acc    = (F - self.b * self.v - self.k * self.x) / self.m
+        self.v += acc * self.DT
+        self.x += self.v * self.DT
+        self.t += self.DT
+        # Rastrear pico para sobrepaso
+        if self.x > self._peak_x:
+            self._peak_x = self.x
+        return self.x, self.v, acc
+
+    def omega_n(self):
+        return math.sqrt(max(self.k, 1e-6) / max(self.m, 1e-6))
+
+    def zeta(self):
+        return self.b / (2.0 * math.sqrt(max(self.k * self.m, 1e-6)))
+
+    def overshoot_pct(self):
+        """Porcentaje de sobrepaso respecto al setpoint."""
+        if abs(self.xd) < 1e-9:
+            return 0.0
+        return max(0.0, (self._peak_x - self.xd) / abs(self.xd) * 100.0)
 
 
-# ──────────────────────────────────────────────────────────────
-#  APLICACIÓN: INTERFAZ GRÁFICA + ANIMACIÓN
-# ──────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+#  EXPORTACIÓN A EXCEL
+# ══════════════════════════════════════════════════════════════════════════════
 
-class SimulatorApp:
+def exportar_excel(hist_t, hist_x, hist_v, hist_e, hist_F, m, k, b, xd, omega, zeta_val):
     """
-    Conecta el controlador difuso con la planta y la interfaz gráfica.
-
-    Optimizaciones de rendimiento:
-    - Historial en deque (O(1) append/pop vs O(n) de list.pop(0))
-    - Arrays numpy internos para evitar conversión en cada frame
-    - Límites de ejes con umbral de cambio para evitar redraws innecesarios
-    - 2 pasos de simulación por frame (más fluido sin lag)
+    Genera un archivo .xlsx con 3 hojas:
+      1. Parametros — m, k, b, xd, ωn, ζ, T, f
+      2. Datos      — tabla t, x, e, v, F con formato de colores
+      3. Graficas   — 3 gráficas de línea incrustadas (x+xd, e, F)
     """
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+        from openpyxl.chart import LineChart, Reference
+        from openpyxl.utils import get_column_letter
+    except ImportError:
+        return None, "openpyxl no instalado. Ejecute: pip install openpyxl"
 
-    HISTORY  = 300   # puntos de historial visibles
-    STEPS_PER_FRAME = 2   # pasos de simulación por callback de animación
+    wb = Workbook()
 
-    def __init__(self):
-        self.ctrl  = FuzzyMRAController()
-        self.plant = MRASystem()
+    # Estilos
+    def fill(hex_c):
+        return PatternFill("solid", fgColor=hex_c)
+    thin  = Side(style='thin', color='BBBBBB')
+    borde = Border(left=thin, right=thin, top=thin, bottom=thin)
+    ctr   = Alignment(horizontal='center', vertical='center')
 
-        self.running = False
-        self.t       = 0.0
-        self.xd      = 1.0
+    # ── HOJA 1: Parámetros ────────────────────────────────────────────────────
+    ws_p = wb.active
+    ws_p.title = 'Parametros'
+    T   = 2 * math.pi / omega if omega > 0 else 0
+    f   = 1 / T if T > 0 else 0
+    Mp  = max(0.0, (max(hist_x) - xd) / abs(xd) * 100) if abs(xd) > 1e-9 and hist_x else 0
 
-        # Historial como deque: append y popleft son O(1)
-        self.hist_t = deque(maxlen=self.HISTORY)
-        self.hist_x = deque(maxlen=self.HISTORY)
-        self.hist_e = deque(maxlen=self.HISTORY)
-        self.hist_F = deque(maxlen=self.HISTORY)
-        self.hist_v = deque(maxlen=self.HISTORY)
+    params = [
+        ('Parámetro',          'Símbolo', 'Valor',              'Unidad'),
+        ('Masa',               'm',       f'{m:.4f}',            'kg'),
+        ('Constante resorte',  'k',       f'{k:.4f}',            'N/m'),
+        ('Amortiguamiento',    'b',       f'{b:.4f}',            'Ns/m'),
+        ('Setpoint',           'xd',      f'{xd:.4f}',           'm'),
+        ('Frec. angular nat.', 'ωn',      f'{omega:.6f}',        'rad/s'),
+        ('Coef. amort.',       'ζ',       f'{zeta_val:.6f}',     '—'),
+        ('Período',            'T',       f'{T:.6f}',            's'),
+        ('Frecuencia',         'f',       f'{f:.6f}',            'Hz'),
+        ('Sobrepaso',          'Mp',      f'{Mp:.2f}',           '%'),
+        ('Tipo de respuesta',  '—',
+         'Subamortiguada' if zeta_val<1 else ('Crítica' if zeta_val==1 else 'Sobreamortiguada'), '—'),
+        ('Puntos grabados',    'N',       str(len(hist_t)),      '—'),
+        ('Generado',           '—',       datetime.datetime.now().strftime('%Y-%m-%d %H:%M'), '—'),
+    ]
 
-        # Arrays numpy espejo del deque (actualizados en _animate)
-        self._arr_t = np.zeros(0)
-        self._arr_x = np.zeros(0)
-        self._arr_e = np.zeros(0)
-        self._arr_F = np.zeros(0)
-        self._arr_v = np.zeros(0)
-
-        # Límites anteriores de ejes (para actualizar solo cuando cambian)
-        self._prev_xlim = (0.0, 1.0)
-        self._prev_ylim_pos   = (-1.0, 2.0)
-        self._prev_ylim_err   = (-5.0, 5.0)
-        self._prev_ylim_force = (-45.0, 45.0)
-        self._prev_ylim_phase = (-3.0, 3.0)
-        self._prev_xlim_phase = (-2.0, 2.0)
-        self._frame_count = 0
-
-        self._build_figure()
-        self._connect_widgets()
-
-    # ── Construcción de la figura ─────────────────────────────
-    def _build_figure(self):
-        self.fig = plt.figure(figsize=(16, 9))
-        self.fig.patch.set_facecolor('#1a1a2e')
-        plt.rcParams.update({'text.color': 'white'})
-
-        gs_main = GridSpec(
-            2, 2, figure=self.fig,
-            left=0.06, right=0.97, top=0.94, bottom=0.32,
-            wspace=0.35, hspace=0.55, width_ratios=[1.1, 1]
-        )
-        style = dict(facecolor='#16213e')
-
-        self.ax_pos   = self.fig.add_subplot(gs_main[0, 0], **style)
-        self.ax_err   = self.fig.add_subplot(gs_main[1, 0], **style)
-        self.ax_anim  = self.fig.add_subplot(gs_main[0, 1], **style)
-        self.ax_phase = self.fig.add_subplot(gs_main[1, 1], **style)
-
-        gs_force = GridSpec(
-            1, 2, figure=self.fig,
-            left=0.06, right=0.97, top=0.30, bottom=0.22, wspace=0.35
-        )
-        self.ax_force = self.fig.add_subplot(gs_force[0, 0], facecolor='#16213e')
-
-        self._style_axes()
-        self._init_lines()
-        self._init_animation_objects()
-        self._build_widgets()
-
-        self.fig.suptitle(
-            'Simulador Masa-Resorte-Amortiguador  ·  Control Difuso Mamdani',
-            color='white', fontsize=13, fontweight='bold', y=0.98
-        )
-
-    def _style_axes(self):
-        axes_cfg = [
-            (self.ax_pos,   'Posicion  x(t)  [m]',        'Tiempo [s]'),
-            (self.ax_err,   'Error  e(t)  [m]',            'Tiempo [s]'),
-            (self.ax_force, 'Fuerza de control  F(t)  [N]','Tiempo [s]'),
-            (self.ax_phase, 'Plano de fase',                'x [m]'),
-            (self.ax_anim,  'Animacion del sistema',        ''),
-        ]
-        for ax, title, xlabel in axes_cfg:
-            ax.set_title(title, color='#e0e0e0', fontsize=9, pad=4)
-            ax.set_xlabel(xlabel, color='#aaaaaa', fontsize=8)
-            ax.tick_params(colors='#aaaaaa', labelsize=7)
-            for sp in ax.spines.values():
-                sp.set_edgecolor('#444466')
-            ax.grid(True, color='#2a2a4a', linewidth=0.5)
-
-        self.ax_phase.set_ylabel("x'  [m/s]", color='#aaaaaa', fontsize=8)
-        self.ax_anim.set_xticks([])
-        self.ax_anim.set_yticks([])
-        self.ax_anim.grid(False)
-
-    def _init_lines(self):
-        self.line_x,  = self.ax_pos.plot([], [], color='#4fc3f7', lw=1.5, label='x(t)')
-        self.line_xd, = self.ax_pos.plot([], [], color='#69f0ae', lw=1.2, ls='--', label='xd')
-        self.ax_pos.legend(loc='upper right', fontsize=7,
-                           facecolor='#1a1a2e', labelcolor='white')
-
-        self.line_e,  = self.ax_err.plot([],   [], color='#ef5350', lw=1.5)
-        self.line_F,  = self.ax_force.plot([], [], color='#ffb74d', lw=1.5)
-        self.line_ph, = self.ax_phase.plot([], [], color='#ce93d8', lw=1.0, alpha=0.7)
-        self.dot_ph,  = self.ax_phase.plot([], [], 'o', color='#ff4081', ms=6, zorder=5)
-
-    # ── Animación física 2D ───────────────────────────────────
-    def _init_animation_objects(self):
-        ax = self.ax_anim
-        ax.set_xlim(-0.5, 5.5)
-        ax.set_ylim(-1.5, 1.5)
-        ax.set_aspect('equal')
-
-        # Pared fija
-        ax.add_patch(mpatches.Rectangle((-0.5, -1.5), 0.3, 3.0,
-                                         color='#546e7a', zorder=1))
-        for y in np.linspace(-1.4, 1.4, 8):
-            ax.plot([-0.5, -0.1], [y, y + 0.3], color='#37474f', lw=0.8, zorder=2)
-
-        # Resorte (zigzag actualizable)
-        self.spring_line, = ax.plot([], [], color='#80cbc4', lw=2, zorder=3)
-
-        # Amortiguador
-        self.damper_body = mpatches.Rectangle((0, -0.25), 0.8, 0.5,
-                                               color='#546e7a', zorder=3)
-        ax.add_patch(self.damper_body)
-        self.damper_rod, = ax.plot([], [], color='#b0bec5', lw=3, zorder=4)
-        self.damper_hatches = [
-            ax.plot([], [], color='#37474f', lw=1, zorder=4)[0] for _ in range(4)
-        ]
-
-        # Masa
-        self.mass_patch = mpatches.FancyBboxPatch(
-            (2.0, -0.5), 0.8, 1.0, boxstyle="round,pad=0.05",
-            facecolor='#5c6bc0', edgecolor='#9fa8da', lw=1.5, zorder=5
-        )
-        ax.add_patch(self.mass_patch)
-        self.mass_text = ax.text(2.4, 0.0, 'M', color='white',
-                                  ha='center', va='center',
-                                  fontsize=9, fontweight='bold', zorder=6)
-
-        # Setpoint
-        self.sp_dot, = ax.plot([], [], 'o', color='#69f0ae', ms=10, zorder=7, label='xd')
-        ax.legend(loc='upper right', fontsize=7, facecolor='#1a1a2e', labelcolor='white')
-        ax.axhline(-0.55, color='#455a64', lw=1.5, zorder=1)
-
-        self._px0    = 1.2
-        self._pscl   = 0.6
-        self._wall_x = -0.2
-
-        # Precomputar el patrón zigzag normalizado (no depende de la posición)
-        n_coils, amp = 8, 0.18
-        n_pts = n_coils * 2 + 2
-        self._spring_t = np.linspace(0., 1., n_pts)
-        self._spring_y = np.zeros(n_pts)
-        for i in range(1, n_pts - 1):
-            self._spring_y[i] = amp if i % 2 == 1 else -amp
-
-    # ── Widgets ───────────────────────────────────────────────
-    def _build_widgets(self):
-        color_slider = '#16213e'
-
-        sl_specs = [
-            ('m',  [0.07, 0.17, 0.18, 0.025],  0.5, 10.0, 1.0,  'kg'),
-            ('k',  [0.07, 0.13, 0.18, 0.025],  1.0, 50.0, 10.0, 'N/m'),
-            ('b',  [0.07, 0.09, 0.18, 0.025],  0.1, 10.0, 1.0,  'Ns/m'),
-            ('xd', [0.07, 0.05, 0.18, 0.025], -3.0,  3.0, 1.0,  'm'),
-        ]
-        self.sliders = {}
-        for name, pos, vmin, vmax, v0, unit in sl_specs:
-            ax_sl = self.fig.add_axes(pos, facecolor=color_slider)
-            sl = Slider(ax_sl, f'{name} [{unit}]', vmin, vmax, valinit=v0,
-                        color='#5c6bc0',
-                        handle_style={'facecolor': '#9fa8da', 'size': 8})
-            sl.label.set_color('#aaaaaa');  sl.label.set_fontsize(8)
-            sl.valtext.set_color('#e0e0e0'); sl.valtext.set_fontsize(8)
-            self.sliders[name] = sl
-
-        ax_br = self.fig.add_axes([0.40, 0.09, 0.10, 0.055], facecolor='#1a1a2e')
-        ax_bx = self.fig.add_axes([0.52, 0.09, 0.10, 0.055], facecolor='#1a1a2e')
-        self.btn_run = Button(ax_br, 'Iniciar',   color='#2e7d32', hovercolor='#43a047')
-        self.btn_rst = Button(ax_bx, 'Reiniciar', color='#6a1b9a', hovercolor='#8e24aa')
-        for btn in (self.btn_run, self.btn_rst):
-            btn.label.set_color('white')
-            btn.label.set_fontsize(9)
-            btn.label.set_fontweight('bold')
-
-        info_ax = self.fig.add_axes([0.68, 0.04, 0.28, 0.15], facecolor='#16213e')
-        info_ax.set_xticks([]); info_ax.set_yticks([])
-        for sp in info_ax.spines.values():
-            sp.set_edgecolor('#444466')
-        self.info_text = info_ax.text(
-            0.05, 0.5, '', transform=info_ax.transAxes,
-            color='#e0e0e0', fontsize=8, va='center', fontfamily='monospace'
-        )
-
-    def _connect_widgets(self):
-        self.sliders['m'].on_changed(self._on_param_change)
-        self.sliders['k'].on_changed(self._on_param_change)
-        self.sliders['b'].on_changed(self._on_param_change)
-        self.sliders['xd'].on_changed(lambda _: setattr(self, 'xd', self.sliders['xd'].val))
-        self.btn_run.on_clicked(self._on_toggle)
-        self.btn_rst.on_clicked(self._on_reset)
-
-    def _on_param_change(self, _):
-        self.plant.m = self.sliders['m'].val
-        self.plant.k = self.sliders['k'].val
-        self.plant.b = self.sliders['b'].val
-
-    def _on_toggle(self, _):
-        self.running = not self.running
-        self.btn_run.label.set_text('Pausar' if self.running else 'Reanudar')
-
-    def _on_reset(self, _):
-        self.running = False
-        self.btn_run.label.set_text('Iniciar')
-        self.t = 0.0
-        self.plant.reset()
-        self.hist_t.clear(); self.hist_x.clear()
-        self.hist_e.clear(); self.hist_F.clear(); self.hist_v.clear()
-        self._frame_count = 0
-
-    # ── Animación física (resorte precomputado) ───────────────
-    def _update_animation(self, x_pos: float):
-        px = float(np.clip(self._px0 + x_pos * self._pscl, 0.3, 4.8))
-
-        # Resorte: escalar el patrón precomputado al largo actual
-        sx = self._wall_x + self._spring_t * (px - self._wall_x)
-        sy = self._spring_y + 0.35
-        self.spring_line.set_data(sx, sy)
-
-        # Amortiguador
-        body_x = self._wall_x + (px - self._wall_x) * 0.3
-        self.damper_body.set_x(body_x)
-        self.damper_rod.set_data([body_x + 0.8, px], [-0.35, -0.35])
-        for i, h in enumerate(self.damper_hatches):
-            rx = body_x + 0.15 + i * 0.17
-            if rx < body_x + 0.8:
-                h.set_data([rx, rx], [-0.5, -0.2])
+    hdrs_fill = ['1F4E79', '2E75B6', '9DC3E6', 'DDEBF7']
+    for r, row in enumerate(params, 1):
+        for c, val in enumerate(row, 1):
+            cell = ws_p.cell(row=r, column=c, value=val)
+            cell.border = borde; cell.alignment = ctr
+            if r == 1:
+                cell.font = Font(bold=True, color='FFFFFF')
+                cell.fill = fill(hdrs_fill[c-1])
             else:
-                h.set_data([], [])
+                cell.fill = fill('EBF3FB' if r % 2 == 0 else 'FFFFFF')
+    for c in range(1, 5):
+        ws_p.column_dimensions[get_column_letter(c)].width = 26
 
-        # Masa y setpoint
-        self.mass_patch.set_x(px)
-        self.mass_text.set_x(px + 0.4)
-        sp_px = float(np.clip(self._px0 + self.xd * self._pscl, 0.3, 4.8))
-        self.sp_dot.set_data([sp_px + 0.4], [0.0])
+    # ── HOJA 2: Datos ─────────────────────────────────────────────────────────
+    ws_d = wb.create_sheet('Datos')
 
-    # ── Actualización de plots con umbrales ───────────────────
-    def _update_plots(self):
-        t = self._arr_t
-        x = self._arr_x
-        e = self._arr_e
-        F = self._arr_F
-        v = self._arr_v
-        n = len(t)
+    cabeceras  = ['t (s)', 'x (m)', 'xd (m)', 'e=xd-x (m)', 'v (m/s)', 'F (N)']
+    hdr_colors = ['333333', 'CC0000', '007700', '7B00CC',     '0033CC',  'FF6600']
 
-        if n < 2:
+    for c, (cab, col) in enumerate(zip(cabeceras, hdr_colors), 1):
+        cell = ws_d.cell(row=1, column=c, value=cab)
+        cell.font = Font(bold=True, color='FFFFFF')
+        cell.fill = fill(col); cell.alignment = ctr; cell.border = borde
+        ws_d.column_dimensions[get_column_letter(c)].width = 16
+
+    for r, (t, x, e, v, F) in enumerate(
+            zip(hist_t, hist_x, hist_e, hist_v, hist_F), 2):
+        fila = [round(t,4), round(x,6), round(xd,4),
+                round(e,6), round(v,6), round(F,4)]
+        alt  = PatternFill("solid", fgColor='F8F8F8' if r % 2 == 0 else 'FFFFFF')
+        for c, val in enumerate(fila, 1):
+            cell = ws_d.cell(row=r, column=c, value=val)
+            cell.border = borde; cell.alignment = ctr; cell.fill = alt
+
+    ws_d.freeze_panes = 'A2'
+    n_rows = len(hist_t)
+
+    # ── HOJA 3: Gráficas ──────────────────────────────────────────────────────
+    ws_g = wb.create_sheet('Graficas')
+
+    def make_chart(title, cols, colors, row_off, height=10):
+        chart = LineChart()
+        chart.title = title; chart.style = 10
+        chart.width = 24; chart.height = height
+        chart.y_axis.title = title.split('(')[0].strip()
+        chart.x_axis.title = 'Tiempo (s)'
+        cats = Reference(ws_d, min_col=1, min_row=2, max_row=n_rows+1)
+        for col_idx, color in zip(cols, colors):
+            data = Reference(ws_d, min_col=col_idx, min_row=1, max_row=n_rows+1)
+            chart.add_data(data, titles_from_data=True)
+            s = chart.series[-1]
+            s.graphicalProperties.line.solidFill = color
+            s.graphicalProperties.line.width     = 18000
+        chart.set_categories(cats)
+        return chart
+
+    # Gráfica 1: x(t) vs xd — columnas 2 y 3
+    ch1 = make_chart('Posicion x(t) vs Setpoint xd  [m]',  [2, 3], ['CC0000','007700'], 1,  11)
+    # Gráfica 2: error e(t)
+    ch2 = make_chart('Error  e(t) = xd - x  [m]',          [4],    ['7B00CC'],          29, 10)
+    # Gráfica 3: fuerza F(t)
+    ch3 = make_chart('Fuerza de control  F(t)  [N]',        [6],    ['FF6600'],          48, 10)
+
+    ws_g.add_chart(ch1, 'A1')
+    ws_g.add_chart(ch2, 'A29')
+    ws_g.add_chart(ch3, 'A48')
+
+    # Guardar
+    carpeta = os.path.join(os.path.expanduser('~'), 'Desktop',
+                           'Sistema_Masa_Resorte')
+    os.makedirs(carpeta, exist_ok=True)
+    ts   = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    path = os.path.join(carpeta, f'MRA_Difuso_{ts}.xlsx')
+    wb.save(path)
+    return path, None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  APLICACIÓN GRÁFICA  (Tkinter — diseño GeoGebra)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class SimuladorDifusoApp:
+    """
+    Interfaz visual estilo GeoGebra:
+
+    ┌────────────┬───────────────────────┬──────────────────────────────────┐
+    │ Sliders    │  Animación vertical   │  Dot-plots deslizantes:          │
+    │  m,k,b,xd │  resorte helicoidal   │   x(t)  rojo  +  xd  verde       │
+    │            │  + masa + xd line     │   e(t)  violeta                  │
+    │            │  + flecha F           │   F(t)  naranja                  │
+    └────────────┴───────────────────────┴──────────────────────────────────┘
+        │  INICIO   PAUSA   REINICIO   │  EXPORTAR EXCEL  │  Métricas      │
+    """
+
+    # ── Dimensiones del canvas ───────────────────────────────────────────────
+    W, H = 1100, 620
+
+    # ── Zona de animación ────────────────────────────────────────────────────
+    CX        = 285    # X central del sistema
+    ANC_Y     = 80     # Y del punto de anclaje (techo)
+    EQ_Y      = 270    # Y de la posición de equilibrio (x=0)
+    PX_PER_M  = 70.0   # píxeles por metro
+
+    # ── Zona de gráficas (derecha) ───────────────────────────────────────────
+    GR_X0, GR_X1 = 450, 1060   # límites X
+    GR_YC    = [115, 240, 365]  # Y central de cada gráfico (x, e, F)
+    GR_AMP   = 50               # amplitud visual normalizada [px]
+    WIN_T    = 10.0             # ventana temporal visible [s]
+
+    # ── Sliders verticales ───────────────────────────────────────────────────
+    # (x_track, y_top, y_bot, v_min, v_max, color_track, color_handle)
+    SLIDER_DEFS = {
+        "m" : ( 38, 110, 245,  0.5, 10.0, "#FF9800", "#E53935"),
+        "k" : (105, 110, 245,  1.0, 50.0, "#9E9E9E", "#1E88E5"),
+        "b" : ( 38, 290, 425,  0.1, 10.0, "#66BB6A", "#2E7D32"),
+        "xd": (105, 290, 425, -2.5,  2.5, "#EF5350", "#880E4F"),
+    }
+    SLIDER_INIT = {"m": 1.0, "k": 10.0, "b": 2.0, "xd": 1.0}
+
+    MAX_PTS = 200   # puntos máximos en historial
+
+    # ── Constructor ──────────────────────────────────────────────────────────
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Sistema MRA — Control Difuso Mamdani  |  CUCEA")
+        self.root.geometry(f"{self.W}x{self.H}")
+        self.root.resizable(False, False)
+        self.root.configure(bg="#1A1A1A")
+
+        self.fis = FuzzyMRAController()
+        self.sys = MRASystem()
+
+        self.running    = False
+        self.dragged    = None
+        self.last_F     = 0.0
+        self.sl_vals    = dict(self.SLIDER_INIT)
+        self._exporting = False
+
+        # Historial (deque O(1))
+        self.h_t = deque(maxlen=self.MAX_PTS)
+        self.h_x = deque(maxlen=self.MAX_PTS)
+        self.h_v = deque(maxlen=self.MAX_PTS)
+        self.h_e = deque(maxlen=self.MAX_PTS)   # error e(t)
+        self.h_F = deque(maxlen=self.MAX_PTS)
+
+        # Canvas principal
+        self.canvas = tk.Canvas(
+            self.root, width=self.W, height=self.H,
+            bg="#FFF176", highlightthickness=0
+        )
+        self.canvas.pack(expand=True)
+
+        self._build_static()
+        self._build_dynamic()
+        self._redraw()
+
+        # Eventos
+        self.canvas.bind("<Button-1>",        self._on_click)
+        self.canvas.bind("<B1-Motion>",       self._on_drag)
+        self.canvas.bind("<ButtonRelease-1>", self._on_release)
+        self.canvas.bind("<Motion>",          self._on_hover)
+
+        # Iniciar bucle
+        self.root.after(20, self._tick)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    #  ELEMENTOS ESTÁTICOS
+    # ─────────────────────────────────────────────────────────────────────────
+    def _build_static(self):
+        c = self.canvas
+
+        # Rejilla amarilla
+        for x in range(0, self.W, 40):
+            c.create_line(x, 0, x, self.H, fill="#E6D500", dash=(2, 6))
+        for y in range(0, self.H, 40):
+            c.create_line(0, y, self.W, y, fill="#E6D500", dash=(2, 6))
+
+        # Título
+        c.create_text(550, 22,
+            text="Sistema Masa-Resorte-Amortiguador  —  Control Difuso Mamdani",
+            font=("Arial", 14, "bold"), fill="#004D40")
+
+        # ── Estructura metálica de soporte ────────────────────────────────
+        sx = self.CX
+        gray = "#666666"
+        c.create_line(sx-95, 70, sx+95, 70,  fill=gray, width=7, capstyle="round")
+        c.create_line(sx-95, 70, sx-95, 390, fill=gray, width=7, capstyle="round")
+        c.create_line(sx+95, 70, sx+95, 390, fill=gray, width=7, capstyle="round")
+        c.create_line(sx-95, 390,sx+95, 390, fill=gray, width=7, capstyle="round")
+        c.create_line(sx-95, 390,sx-110, 430,fill=gray, width=7)
+        c.create_line(sx+95, 390,sx+110, 430,fill=gray, width=7)
+        # Articulaciones azules
+        for jx, jy in [(sx,70),(sx-95,70),(sx+95,70),(sx-95,390),(sx+95,390)]:
+            c.create_oval(jx-5,jy-5,jx+5,jy+5, fill="#4285F4",
+                          outline="#212121", width=1.5)
+
+        # Flecha Y (fija, morada)
+        c.create_line(220, 245, 220, 160, fill="#7B1FA2",
+                      width=2.5, arrow="last")
+        c.create_text(208, 158, text="Y",
+                      font=("Arial", 11, "bold"), fill="#7B1FA2")
+
+        # ── Ejes de los 3 gráficos ────────────────────────────────────────
+        x0, x1 = self.GR_X0, self.GR_X1
+        # Eje vertical compartido
+        c.create_line(x0, 45, x0, 430, fill="black", width=1.5)
+        # Eje horizontal de cada gráfico + banda de fondo
+        colores_banda = ["#FFEDED", "#F0EDFF", "#FFF0E0"]
+        for yc, banda in zip(self.GR_YC, colores_banda):
+            c.create_rectangle(x0, yc-self.GR_AMP-5, x1, yc+self.GR_AMP+5,
+                               fill=banda, outline="")
+            c.create_line(x0, yc, x1, yc, fill="#333333", width=1.5)
+
+        # Etiquetas de señal
+        lbl_data = [
+            ("x / xd", "#CC0000"),
+            ("e(t)",   "#7B00CC"),
+            ("F(t)",   "#FF6600"),
+        ]
+        for yc, (lbl, col) in zip(self.GR_YC, lbl_data):
+            c.create_text(x0-20, yc, text=lbl,
+                          font=("Arial", 11, "bold"), fill=col, anchor="e")
+            c.create_text(x1+18, yc, text="t",
+                          font=("Arial", 11, "italic"), fill="black")
+
+        # Separador entre zona de animación y gráficos
+        c.create_line(435, 40, 435, 440, fill="#BBBBBB", width=1, dash=(4,4))
+
+        # ── Panel de ecuaciones (parte inferior derecha) ───────────────────
+        c.create_rectangle(450, 445, 1085, 540,
+                           fill="white", outline="#AAAAAA", width=1)
+        c.create_text(760, 453, anchor="n",
+            text="Ecuaciones del sistema:",
+            font=("Arial", 9, "bold"), fill="#004D40")
+        ecuaciones = [
+            ("m·ẍ + b·ẋ + k·x = F(t)",   "#333333", 460, 468),
+            ("ωn = √(k/m)",                "#0033CC", 460, 482),
+            ("ζ  = b / (2√(k·m))",         "#0033CC", 460, 496),
+            ("e(t) = xd − x(t)",           "#7B00CC", 460, 510),
+            ("F(t) = FIS_Mamdani(e, ė)",   "#CC0000", 460, 524),
+            ("x(t)→xd  cuando  t→∞",       "#007700", 680, 468),
+            ("Entradas FIS: e∈[−4,4]m",    "#555555", 680, 482),
+            ("             de∈[−6,6]m/s",  "#555555", 680, 496),
+            ("Salida FIS:   F∈[−40,40]N",  "#FF6600", 680, 510),
+            ("25 reglas — Centroide",       "#555555", 680, 524),
+        ]
+        for txt, col, ex, ey in ecuaciones:
+            c.create_text(ex, ey, text=txt, anchor="w",
+                          font=("Courier", 9, "bold"), fill=col)
+
+        # ── Tracks de los sliders ─────────────────────────────────────────
+        sl_labels = {"m":"Masa","k":"Resorte","b":"Amortig.","xd":"Setpoint"}
+        for name, (xt, yt, yb, _, _, col_t, _) in self.SLIDER_DEFS.items():
+            c.create_line(xt, yt, xt, yb, fill=col_t, width=5)
+            c.create_text(xt, yt-12, text=sl_labels[name],
+                          font=("Arial", 8, "bold"), fill="#333333")
+
+        # ── Botones de control (fondo blanco con borde coloreado) ─────────
+        btns = [
+            (115, 555, 202, 592, "INICIO",   "#CC0000", "btn_inicio"),
+            (210, 555, 297, 592, "PAUSA",    "#0033CC", "btn_pausa"),
+            (305, 555, 417, 592, "REINICIO", "#007700", "btn_reinicio"),
+        ]
+        for x1b,y1b,x2b,y2b,lbl,col,tag in btns:
+            c.create_rectangle(x1b,y1b,x2b,y2b,
+                               fill="white", outline=col, width=2.5,
+                               tags=("btn", tag))
+            c.create_text((x1b+x2b)//2, (y1b+y2b)//2,
+                          text=lbl, font=("Arial", 10, "bold"),
+                          fill=col, tags=("btn", tag))
+
+        # Botón Excel (verde oscuro)
+        c.create_rectangle(430, 555, 620, 592,
+                           fill="#E8F5E9", outline="#2E7D32", width=2.5,
+                           tags=("btn","btn_excel"))
+        c.create_text(525, 573,
+                      text="EXPORTAR EXCEL  ↓",
+                      font=("Arial", 10, "bold"), fill="#1B5E20",
+                      tags=("btn","btn_excel"))
+
+        # Encabezado panel de sliders
+        c.create_text(72, 95, text="PARÁMETROS",
+                      font=("Arial", 9, "bold"), fill="#333333")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    #  ELEMENTOS DINÁMICOS
+    # ─────────────────────────────────────────────────────────────────────────
+    def _build_dynamic(self):
+        c = self.canvas
+
+        # Etiquetas de valor de sliders
+        self.id_lbl = {}
+        lbl_cols = {"m":"#C62828","k":"#1565C0","b":"#2E7D32","xd":"#880E4F"}
+        y_lbl    = {"m": 97,"k": 97,"b":278,"xd":278}
+        for name in self.SLIDER_DEFS:
+            self.id_lbl[name] = c.create_text(
+                self.SLIDER_DEFS[name][0], y_lbl[name],
+                text="", font=("Arial", 9, "bold"), fill=lbl_cols[name])
+
+        # Handles de sliders
+        self.id_hdl = {}
+        for name, (*_, col_t, col_h) in self.SLIDER_DEFS.items():
+            self.id_hdl[name] = c.create_oval(
+                0,0,0,0, fill=col_h, outline="#212121", width=1.5)
+
+        # ── Elementos de la animación ──────────────────────────────────────
+        # Resorte helicoidal (smooth curve)
+        self.id_spring = c.create_line(
+            0,0,0,0, fill="#1565C0", width=3, smooth=True)
+
+        # Masa esférica (roja con brillo)
+        self.id_mass    = c.create_oval(0,0,0,0, fill="#D32F2F",
+                                         outline="#1A1A1A", width=2)
+        self.id_mass_hi = c.create_oval(0,0,0,0, fill="white", outline="")
+        self.id_joint   = c.create_oval(0,0,0,0, fill="#4285F4",
+                                         outline="#212121", width=1.5)
+
+        # Línea de setpoint xd (verde punteada)
+        self.id_xd_line = c.create_line(0,0,0,0, fill="#2E7D32",
+                                         dash=(8,4), width=2)
+        self.id_xd_lbl  = c.create_text(0,0, text="xd",
+                                         font=("Arial",9,"bold"), fill="#2E7D32")
+
+        # Flecha de fuerza F (naranja)
+        self.id_F_arr = c.create_line(0,0,0,0, fill="#FF6600",
+                                       width=3, arrow="last",
+                                       arrowshape=(10,12,5))
+        self.id_F_lbl = c.create_text(0,0, text="F",
+                                       font=("Arial",11,"bold"), fill="#FF6600")
+
+        # Línea de xd en gráfico x(t) (verde punteada horizontal)
+        self.id_gxd = c.create_line(
+            self.GR_X0, self.GR_YC[0],
+            self.GR_X1, self.GR_YC[0],
+            fill="#007700", dash=(6,3), width=1.5
+        )
+
+        # Texto de tiempo (dentro animación)
+        self.id_time   = c.create_text(285, 420, text="t = 0.000 s",
+                                        font=("Arial",12,"bold"), fill="#111111")
+        # Métricas (ωn, ζ, e, Mp)
+        self.id_metrics = c.create_text(285, 443, text="",
+                                         font=("Arial", 9), fill="#333333")
+        # Estado convergencia
+        self.id_state   = c.create_text(285, 462, text="",
+                                         font=("Arial", 10, "bold"), fill="#007700")
+        # Estado del export
+        self.id_export_st = c.create_text(525, 545, text="",
+                                           font=("Arial", 8), fill="#1B5E20")
+
+        # ── Dot-plots pre-creados ──────────────────────────────────────────
+        # x(t): rojo  |  xd line: verde (constante, manejada aparte)
+        # e(t): violeta  |  F(t): naranja
+        dot_cfg = [("x","#CC0000"), ("e","#7B00CC"), ("F","#FF6600")]
+        self.id_dots = {k: [] for k,_ in dot_cfg}
+        for key, col in dot_cfg:
+            for _ in range(self.MAX_PTS):
+                self.id_dots[key].append(
+                    c.create_oval(0,0,0,0, fill=col, outline="",
+                                  state="hidden"))
+
+    # ─────────────────────────────────────────────────────────────────────────
+    #  REDIBUJADO
+    # ─────────────────────────────────────────────────────────────────────────
+    def _redraw(self):
+        c   = self.canvas
+        sys = self.sys
+        sv  = self.sl_vals
+
+        # ── Sliders ───────────────────────────────────────────────────────
+        units = {"m":"kg","k":"N/m","b":"Ns/m","xd":"m"}
+        for name, (xt, yt, yb, vmin, vmax, *_) in self.SLIDER_DEFS.items():
+            val  = sv[name]
+            frac = (val - vmin) / (vmax - vmin)
+            yh   = yb - frac * (yb - yt)
+            c.coords(self.id_hdl[name], xt-9, yh-9, xt+9, yh+9)
+            c.itemconfig(self.id_lbl[name],
+                         text=f"{name} = {val:.2f} {units[name]}")
+
+        # ── Posición masa en pantalla ─────────────────────────────────────
+        y_mass = self.EQ_Y + sys.x * self.PX_PER_M
+        y_mass = max(120, min(385, y_mass))
+        # Radio escala con la masa (visual)
+        r_mass = 15 + sv["m"] / 10.0 * 8
+        y_top  = y_mass - r_mass
+
+        # ── Resorte helicoidal animado ────────────────────────────────────
+        cx   = self.CX
+        y_a  = self.ANC_Y + 8
+        y_b  = y_top - 2
+        pts  = [cx, self.ANC_Y, cx, y_a]
+        if y_b > y_a + 4:
+            n_coil, steps = 14, 130
+            for i in range(steps + 1):
+                frac  = i / steps
+                y_p   = y_a + frac * (y_b - y_a)
+                theta = frac * n_coil * 2 * math.pi
+                x_p   = cx + 22 * math.sin(theta)
+                pts.extend([x_p, y_p])
+        pts.extend([cx, y_top])
+        c.coords(self.id_spring, *pts)
+
+        # ── Masa ──────────────────────────────────────────────────────────
+        c.coords(self.id_mass,
+                 cx-r_mass, y_mass-r_mass, cx+r_mass, y_mass+r_mass)
+        hi = r_mass * 0.30
+        c.coords(self.id_mass_hi,
+                 cx-r_mass*0.40-hi, y_mass-r_mass*0.40-hi,
+                 cx-r_mass*0.40+hi, y_mass-r_mass*0.40+hi)
+        c.coords(self.id_joint, cx-5, y_top-5, cx+5, y_top+5)
+
+        # ── Línea de setpoint xd ─────────────────────────────────────────
+        y_xd = self.EQ_Y + sv["xd"] * self.PX_PER_M
+        y_xd = max(120, min(385, y_xd))
+        c.coords(self.id_xd_line, cx-90, y_xd, cx+90, y_xd)
+        c.coords(self.id_xd_lbl,  cx+103, y_xd)
+
+        # ── Flecha fuerza F ───────────────────────────────────────────────
+        F = self.last_F
+        if abs(F) > 0.5:
+            pf = F * 1.2
+            y_fend = max(50, min(500, y_mass + pf))
+            c.coords(self.id_F_arr, cx, y_mass, cx, y_fend)
+            c.coords(self.id_F_lbl, cx + 24, (y_mass + y_fend) / 2)
+            c.itemconfig(self.id_F_arr, state="normal")
+            c.itemconfig(self.id_F_lbl, state="normal")
+        else:
+            c.itemconfig(self.id_F_arr, state="hidden")
+            c.itemconfig(self.id_F_lbl, state="hidden")
+
+        # ── Métricas ──────────────────────────────────────────────────────
+        wn = sys.omega_n(); z = sys.zeta()
+        e  = sv["xd"] - sys.x
+        Mp = sys.overshoot_pct()
+        c.itemconfig(self.id_time, text=f"t = {sys.t:.2f} s")
+        c.itemconfig(self.id_metrics,
+            text=(f"ωn={wn:.3f} r/s   ζ={z:.3f}   "
+                  f"e={e:+.3f}m   Mp={Mp:.1f}%"))
+        if abs(e) < 0.05 and abs(sys.v) < 0.05 and sys.t > 0.1:
+            c.itemconfig(self.id_state, text="✔ CONVERGIDO", fill="#007700")
+        else:
+            c.itemconfig(self.id_state, text="~ CONTROLANDO", fill="#CC0000")
+
+        # ── Línea xd en gráfico x(t) ──────────────────────────────────────
+        # Normalizar posición xd a píxeles del gráfico
+        mx_sig = max((abs(v) for v in self.h_x), default=abs(sv["xd"])+0.01)
+        mx_sig = max(mx_sig, abs(sv["xd"]) + 0.01)
+        py_xd  = self.GR_YC[0] - (sv["xd"] / mx_sig) * self.GR_AMP
+        c.coords(self.id_gxd, self.GR_X0, py_xd, self.GR_X1, py_xd)
+
+        # ── Dot-plots deslizantes ─────────────────────────────────────────
+        n     = len(self.h_t)
+        t_now = sys.t
+        x0, x1 = self.GR_X0, self.GR_X1
+        yc_x, yc_e, yc_F = self.GR_YC
+
+        mx_e = max((abs(v) for v in self.h_e), default=1.0) or 1.0
+        mv_F = max((abs(v) for v in self.h_F), default=1.0) or 1.0
+
+        for i in range(self.MAX_PTS):
+            if i < n:
+                dt_back = t_now - self.h_t[i]
+                if 0.0 <= dt_back <= self.WIN_T:
+                    px = x1 - (dt_back / self.WIN_T) * (x1 - x0)
+
+                    # x(t) normalizado
+                    py_x = yc_x - (self.h_x[i] / mx_sig) * self.GR_AMP
+                    # e(t) normalizado
+                    py_e = yc_e - (self.h_e[i] / mx_e) * self.GR_AMP
+                    # F(t) normalizado
+                    py_F = yc_F - (self.h_F[i] / mv_F) * self.GR_AMP
+
+                    for key, py in [("x",py_x),("e",py_e),("F",py_F)]:
+                        c.coords(self.id_dots[key][i], px-2,py-2, px+2,py+2)
+                        c.itemconfig(self.id_dots[key][i], state="normal")
+                    continue
+
+            for key in ("x","e","F"):
+                c.itemconfig(self.id_dots[key][i], state="hidden")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    #  BUCLE DE SIMULACIÓN (20 ms → dt=0.02 s → tiempo real 1:1)
+    # ─────────────────────────────────────────────────────────────────────────
+    def _tick(self):
+        if self.running:
+            e  = self.sys.xd - self.sys.x
+            de = -self.sys.v
+            F  = self.fis.infer(e, de)
+            self.last_F = F
+            x, v, _ = self.sys.step(F)
+
+            self.h_t.append(self.sys.t)
+            self.h_x.append(x)
+            self.h_v.append(v)
+            self.h_e.append(e)
+            self.h_F.append(F)
+
+            self._redraw()
+
+        self.root.after(20, self._tick)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    #  PARÁMETROS Y RESET
+    # ─────────────────────────────────────────────────────────────────────────
+    def _apply_and_reset(self):
+        sv = self.sl_vals
+        self.sys.m = sv["m"]; self.sys.k = sv["k"]
+        self.sys.b = sv["b"]; self.sys.xd = sv["xd"]
+        self.sys.reset()
+        self.h_t.clear(); self.h_x.clear()
+        self.h_v.clear(); self.h_e.clear(); self.h_F.clear()
+        self.last_F = 0.0
+
+    # ─────────────────────────────────────────────────────────────────────────
+    #  EXPORTAR EXCEL  (en hilo separado para no congelar la UI)
+    # ─────────────────────────────────────────────────────────────────────────
+    def _on_export(self):
+        if self._exporting:
+            return
+        if len(self.h_t) < 5:
+            self.canvas.itemconfig(self.id_export_st,
+                                   text="Inicia la simulacion primero")
             return
 
-        t_min, t_max = float(t[0]), float(t[-1])
+        self._exporting = True
+        self.canvas.itemconfig(self.id_export_st, text="Exportando...")
 
-        # ── Posición ──
-        self.line_x.set_data(t, x)
-        self.line_xd.set_data([t_min, t_max], [self.xd, self.xd])
-        xlim = (t_min, max(t_max, t_min + 1.0))
-        if xlim != self._prev_xlim:
-            self.ax_pos.set_xlim(*xlim)
-            self.ax_err.set_xlim(*xlim)
-            self.ax_force.set_xlim(*xlim)
-            self._prev_xlim = xlim
-
-        x_lo = min(float(x.min()), self.xd) - 0.4
-        x_hi = max(float(x.max()), self.xd) + 0.4
-        if abs(x_lo - self._prev_ylim_pos[0]) > 0.05 or \
-           abs(x_hi - self._prev_ylim_pos[1]) > 0.05:
-            self.ax_pos.set_ylim(x_lo, x_hi)
-            self._prev_ylim_pos = (x_lo, x_hi)
-
-        # ── Error ──
-        self.line_e.set_data(t, e)
-        e_lo = float(e.min()) - 0.2
-        e_hi = float(e.max()) + 0.2
-        if abs(e_lo - self._prev_ylim_err[0]) > 0.05 or \
-           abs(e_hi - self._prev_ylim_err[1]) > 0.05:
-            self.ax_err.set_ylim(e_lo, e_hi)
-            self._prev_ylim_err = (e_lo, e_hi)
-
-        # ── Fuerza ──
-        self.line_F.set_data(t, F)
-        F_lo = float(F.min()) - 1.0
-        F_hi = float(F.max()) + 1.0
-        if abs(F_lo - self._prev_ylim_force[0]) > 0.5 or \
-           abs(F_hi - self._prev_ylim_force[1]) > 0.5:
-            self.ax_force.set_ylim(F_lo, F_hi)
-            self._prev_ylim_force = (F_lo, F_hi)
-
-        # ── Plano de fase ──
-        self.line_ph.set_data(x, v)
-        self.dot_ph.set_data([x[-1]], [v[-1]])
-        px_lo = float(x.min()) - 0.3
-        px_hi = float(x.max()) + 0.3
-        pv_lo = float(v.min()) - 0.3
-        pv_hi = float(v.max()) + 0.3
-        if abs(px_lo - self._prev_xlim_phase[0]) > 0.1 or \
-           abs(px_hi - self._prev_xlim_phase[1]) > 0.1:
-            self.ax_phase.set_xlim(px_lo, px_hi)
-            self._prev_xlim_phase = (px_lo, px_hi)
-        if abs(pv_lo - self._prev_ylim_phase[0]) > 0.1 or \
-           abs(pv_hi - self._prev_ylim_phase[1]) > 0.1:
-            self.ax_phase.set_ylim(pv_lo, pv_hi)
-            self._prev_ylim_phase = (pv_lo, pv_hi)
-
-        # ── Cuadro de información (cada 3 frames para no thrashear) ──
-        if self._frame_count % 3 == 0:
-            self.info_text.set_text(
-                f"  t   = {self.t:7.2f} s\n"
-                f"  x   = {self.plant.x:+7.4f} m\n"
-                f"  x'  = {self.plant.v:+7.4f} m/s\n"
-                f"  e   = {float(e[-1]):+7.4f} m\n"
-                f"  F   = {float(F[-1]):+7.4f} N\n"
-                f"  m={self.plant.m:.1f}  k={self.plant.k:.1f}  b={self.plant.b:.1f}"
-            )
-
-    # ── Callback principal de animación ──────────────────────
-    def _animate(self, _frame: int):
-        """
-        FuncAnimation llama aquí cada ~20 ms.
-        Ejecuta STEPS_PER_FRAME pasos de simulación para mayor fluidez.
-        """
-        if not self.running:
-            return []
-
-        # Avanzar N pasos por frame (la simulación avanza más rápido que el reloj)
-        for _ in range(self.STEPS_PER_FRAME):
-            x = self.plant.x
-            v = self.plant.v
-            e  = self.xd - x
-            de = -v
-            F  = self.ctrl.infer(e, de)
-
-            self.plant.step(F)
-            self.t += self.plant.dt
-
-            self.hist_t.append(self.t)
-            self.hist_x.append(self.plant.x)
-            self.hist_e.append(e)
-            self.hist_F.append(F)
-            self.hist_v.append(v)
-
-        self._frame_count += 1
-
-        # Convertir deques a arrays numpy solo cuando hay datos nuevos
-        self._arr_t = np.fromiter(self.hist_t, dtype=float, count=len(self.hist_t))
-        self._arr_x = np.fromiter(self.hist_x, dtype=float, count=len(self.hist_x))
-        self._arr_e = np.fromiter(self.hist_e, dtype=float, count=len(self.hist_e))
-        self._arr_F = np.fromiter(self.hist_F, dtype=float, count=len(self.hist_F))
-        self._arr_v = np.fromiter(self.hist_v, dtype=float, count=len(self.hist_v))
-
-        self._update_plots()
-        self._update_animation(self.plant.x)
-
-        return []
-
-    # ── Lanzador ─────────────────────────────────────────────
-    def run(self):
-        """Inicia la animación y muestra la ventana."""
-        self.anim = animation.FuncAnimation(
-            self.fig, self._animate,
-            interval=20,
-            blit=False,
-            cache_frame_data=False
+        # Captura de datos en el hilo principal antes de lanzar hilo
+        data = (
+            list(self.h_t), list(self.h_x), list(self.h_v),
+            list(self.h_e), list(self.h_F),
+            self.sys.m, self.sys.k, self.sys.b, self.sys.xd,
+            self.sys.omega_n(), self.sys.zeta()
         )
-        plt.show()
+
+        def worker():
+            path, err = exportar_excel(*data)
+            self._exporting = False
+            if err:
+                self.root.after(0, lambda: self.canvas.itemconfig(
+                    self.id_export_st, text=f"Error: {err}"))
+            else:
+                nombre = os.path.basename(path)
+                self.root.after(0, lambda: self.canvas.itemconfig(
+                    self.id_export_st, text=f"Guardado: {nombre}"))
+                try:
+                    os.startfile(path)
+                except Exception:
+                    pass
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    # ─────────────────────────────────────────────────────────────────────────
+    #  EVENTOS DE RATÓN
+    # ─────────────────────────────────────────────────────────────────────────
+    def _slider_hit(self, mx, my):
+        sv = self.sl_vals
+        for name, (xt, yt, yb, vmin, vmax, *_) in self.SLIDER_DEFS.items():
+            frac = (sv[name] - vmin) / (vmax - vmin)
+            yh   = yb - frac * (yb - yt)
+            if abs(mx - xt) <= 13 and abs(my - yh) <= 13:
+                return name
+        return None
+
+    def _on_click(self, ev):
+        x, y = ev.x, ev.y
+
+        # Slider
+        name = self._slider_hit(x, y)
+        if name:
+            self.dragged = name; return
+
+        # INICIO
+        if 115 <= x <= 202 and 555 <= y <= 592:
+            self.running = True; return
+        # PAUSA
+        if 210 <= x <= 297 and 555 <= y <= 592:
+            self.running = False; return
+        # REINICIO
+        if 305 <= x <= 417 and 555 <= y <= 592:
+            self.running = False
+            self._apply_and_reset()
+            self._redraw(); return
+        # EXCEL
+        if 430 <= x <= 620 and 555 <= y <= 592:
+            self._on_export(); return
+
+    def _on_drag(self, ev):
+        if not self.dragged: return
+        name = self.dragged
+        xt, yt, yb, vmin, vmax, *_ = self.SLIDER_DEFS[name]
+        y_cl = max(yt, min(yb, ev.y))
+        frac = (yb - y_cl) / (yb - yt)
+        self.sl_vals[name] = vmin + frac * (vmax - vmin)
+        self._apply_and_reset()
+        self._redraw()
+
+    def _on_release(self, ev):
+        self.dragged = None
+
+    def _on_hover(self, ev):
+        x, y = ev.x, ev.y
+        over = bool(self._slider_hit(x, y))
+        if 115 <= x <= 620 and 555 <= y <= 592: over = True
+        self.canvas.config(cursor="hand2" if over else "")
 
 
-# ──────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 #  PUNTO DE ENTRADA
-# ──────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 
-if __name__ == '__main__':
-    app = SimulatorApp()
-    app.run()
+if __name__ == "__main__":
+    root = tk.Tk()
+    app  = SimuladorDifusoApp(root)
+    root.mainloop()
